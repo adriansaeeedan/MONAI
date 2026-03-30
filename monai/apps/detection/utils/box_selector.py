@@ -64,6 +64,8 @@ class BoxSelector:
         topk_candidates_per_level: max number of boxes to keep for each level
         nms_thresh: box overlapping threshold for NMS
         detections_per_img: max number of boxes to keep for each image
+        select_single_label_per_box: if True, keep only the best-scoring class
+            per box before thresholding and NMS. Defaults to False.
 
     Example:
 
@@ -93,6 +95,7 @@ class BoxSelector:
         topk_candidates_per_level: int = 1000,
         nms_thresh: float = 0.5,
         detections_per_img: int = 300,
+        select_single_label_per_box: bool = False,
     ):
         self.box_overlap_metric = box_overlap_metric
 
@@ -101,6 +104,7 @@ class BoxSelector:
         self.topk_candidates_per_level = topk_candidates_per_level
         self.nms_thresh = nms_thresh
         self.detections_per_img = detections_per_img
+        self.select_single_label_per_box = select_single_label_per_box
 
     def select_top_score_idx_per_level(self, logits: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         """
@@ -120,14 +124,27 @@ class BoxSelector:
             - selected_scores: selected M scores, Tensor sized (M, )
             - selected_labels: selected M labels, Tensor sized (M, )
         """
-        num_classes = logits.shape[-1]
-
         # apply sigmoid to classification logits if asked
         if self.apply_sigmoid:
-            scores = torch.sigmoid(logits.to(torch.float32)).flatten()
+            scores = torch.sigmoid(logits.to(torch.float32))
         else:
-            scores = logits.flatten()
+            scores = logits.to(torch.float32)
 
+        if self.select_single_label_per_box:
+            scores, selected_labels = scores.max(dim=1)
+            keep_idxs = scores > self.score_thresh
+            scores = scores[keep_idxs]
+            topk_idxs = torch.where(keep_idxs)[0]
+            selected_labels = selected_labels[keep_idxs]
+
+            num_topk = min(self.topk_candidates_per_level, topk_idxs.size(0))
+            selected_scores, idxs = scores.topk(num_topk)
+            topk_idxs = topk_idxs[idxs]
+            selected_labels = selected_labels[idxs]
+            return topk_idxs, selected_scores, selected_labels
+
+        num_classes = logits.shape[-1]
+        scores = scores.flatten()
         # remove low scoring boxes
         keep_idxs = scores > self.score_thresh
         scores = scores[keep_idxs]

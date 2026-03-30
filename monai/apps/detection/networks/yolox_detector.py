@@ -193,6 +193,7 @@ class YOLOXDetector(nn.Module):
             nms_thresh=0.5,
             detections_per_img=300,
             apply_sigmoid=False,  # YOLOX: scores are already computed outside
+            select_single_label_per_box=True,
         )
 
         # Cached grid state (rebuilt when image shape changes)
@@ -291,6 +292,7 @@ class YOLOXDetector(nn.Module):
             topk_candidates_per_level=topk_candidates_per_level,
             nms_thresh=nms_thresh,
             detections_per_img=detections_per_img,
+            select_single_label_per_box=True,
         )
 
     def set_target_keys(self, box_key: str, label_key: str) -> None:
@@ -399,9 +401,9 @@ class YOLOXDetector(nn.Module):
         reg_maps: list[Tensor] = head_outputs[self.box_reg_key]
         obj_maps: list[Tensor] = head_outputs[self.obj_key]
 
-        grid_centers, strides_all = self._generate_grids(cls_maps, images.device)
+        grid_points, strides_all = self._generate_grids(cls_maps, images.device)
         # Decode all levels: (B, N_total, 2*sdims) in StandardMode
-        pred_boxes_std, raw_reg_all = self._decode_predictions(reg_maps, grid_centers, strides_all)
+        pred_boxes_std, raw_reg_all = self._decode_predictions(reg_maps, grid_points, strides_all)
         # Reshape cls and obj: (B, N_total, num_classes) and (B, N_total, 1)
         pred_cls = self._concat_level_outputs(cls_maps, self.num_classes)
         pred_obj = self._concat_level_outputs(obj_maps, 1)
@@ -415,7 +417,7 @@ class YOLOXDetector(nn.Module):
                 pred_cls,
                 pred_obj,
                 raw_reg_all,
-                grid_centers,
+                grid_points,
                 strides_all,
                 targets,  # type: ignore[arg-type]
                 num_anchor_locs_per_level,
@@ -446,7 +448,8 @@ class YOLOXDetector(nn.Module):
             device: target device.
 
         Returns:
-            - ``grid_centers``: (N_total, D) centre pixel coordinates.
+            - ``grid_points``: (N_total, D) grid-point coordinates in pixel
+              space, aligned with MONAI's native spatial axis order.
             - ``strides_all``: (N_total,) stride value per point.
         """
         img_shape = tuple(cls_maps[0].shape[2:])
@@ -465,14 +468,15 @@ class YOLOXDetector(nn.Module):
             # torch.meshgrid returns grids in (dim0, dim1[, dim2]) indexing
             grids = torch.meshgrid(*ranges, indexing="ij")  # each: spatial shape
 
-            # Stack to (H, W[, D], ndims) then flatten to (N, ndims)
-            # Reorder to (x, y[, z]) = last-dim-first (consistent with YOLOX)
-            centers = torch.stack(list(reversed(grids)), dim=-1)  # reverse: (x,y,z) order
+            # Stack to (*spatial, ndims) then flatten to (N, ndims).
+            # Keep MONAI's native spatial axis order so decoded boxes, GT boxes,
+            # clipping, and NMS all use the same coordinate convention.
+            centers = torch.stack(grids, dim=-1)
             n_pts = centers.shape[:-1].numel()
             centers = centers.view(n_pts, self.spatial_dims)  # (N, D)
 
-            # Add 0.5 to get pixel-space centres and multiply by stride
-            centers = (centers + 0.5) * stride
+            # Convert integer grid indices to pixel-space grid origins.
+            centers = centers * stride
 
             strides = torch.full((n_pts,), stride, dtype=torch.float32, device=device)
             all_centers.append(centers)
@@ -489,7 +493,7 @@ class YOLOXDetector(nn.Module):
     def _decode_predictions(
         self,
         reg_maps: list[Tensor],
-        grid_centers: Tensor,
+        grid_points: Tensor,
         strides: Tensor,
     ) -> tuple[Tensor, Tensor]:
         """Decode raw regression maps to centre-size boxes, then convert to StandardMode.
@@ -497,14 +501,14 @@ class YOLOXDetector(nn.Module):
         Raw regression format for each grid point:
         - First ``spatial_dims`` channels: raw centre offsets (δx, δy[, δz]).
           Decoded: ``cx = (raw_cx + grid_cx_in_stride_units) * stride``.
-          Note: grid_centers already has ``(grid_idx + 0.5) * stride`` applied,
-          so: ``cx = raw_cx * stride + grid_cx_pixel``.
+          Here ``grid_points`` stores ``grid_idx * stride`` in pixel space, so
+          decoding is ``cx = raw_cx * stride + grid_point_pixel``.
         - Last ``spatial_dims`` channels: raw log-size (log_w, log_h[, log_d]).
           Decoded: ``w = exp(raw_w) * stride``.
 
         Args:
             reg_maps: list of (B, 2*D, *spatial) tensors per level.
-            grid_centers: (N_total, D) pixel-space grid centres.
+            grid_points: (N_total, D) pixel-space grid origins.
             strides: (N_total,) stride per grid point.
 
         Returns:
@@ -524,14 +528,7 @@ class YOLOXDetector(nn.Module):
             raw = feat_map.flatten(start_dim=2).permute(0, 2, 1)  # (B, n_pts, 2*D)
             level_raw.append(raw)
 
-            gc = grid_centers[idx : idx + n_pts]   # (n_pts, D)
-            # Decode centre: raw offset is relative to grid cell in stride units
-            # grid_centers already contains (grid_idx + 0.5) * stride
-            # So: pred_cx = raw_cx + grid_cx  (raw_cx interpreted as pixel-space delta per stride)
-            # Standard YOLOX: pred_cx = (raw_cx + grid_x) * stride
-            # But our grid_centers = (grid_x + 0.5) * stride, so:
-            # pred_cx = raw_cx * stride + (grid_x + 0.5)*stride = (raw_cx + grid_x + 0.5)*stride
-            # This is equivalent to: gc + raw_centre * stride
+            gc = grid_points[idx : idx + n_pts]   # (n_pts, D)
             raw_centre = raw[..., :sdims]  # (B, n, D)
             raw_size = raw[..., sdims:]     # (B, n, D)
 
@@ -570,7 +567,7 @@ class YOLOXDetector(nn.Module):
         pred_cls: Tensor,
         pred_obj: Tensor,
         raw_reg_all: Tensor,
-        grid_centers: Tensor,
+        grid_points: Tensor,
         strides_all: Tensor,
         targets: list[dict[str, Tensor]],
         num_anchor_locs_per_level: list[int],
@@ -582,7 +579,7 @@ class YOLOXDetector(nn.Module):
             pred_cls: (B, N, num_classes) classification logits.
             pred_obj: (B, N, 1) objectness logits.
             raw_reg_all: (B, N, 2*D) raw regression outputs for optional L1.
-            grid_centers: (N, D) pixel-space grid centres.
+            grid_points: (N, D) pixel-space grid origins.
             strides_all: (N,) stride per grid point.
             targets: list of per-image target dicts.
             num_anchor_locs_per_level: number of grid points per FPN level.
@@ -597,8 +594,8 @@ class YOLOXDetector(nn.Module):
         total_l1_loss = torch.zeros(1, device=device)
         num_fg_total = 0
         num_gt_total = 0
-        sdims = self.spatial_dims
         B = pred_boxes_std.shape[0]
+        matching_centers = grid_points + 0.5 * strides_all.unsqueeze(-1)
 
         for b_idx in range(B):
             gt_boxes = targets[b_idx][self.target_box_key]      # (num_gt, 2*D)
@@ -616,30 +613,22 @@ class YOLOXDetector(nn.Module):
                 total_obj_loss += self.obj_loss_func(pred_obj_b, obj_target).sum()
                 continue
 
-            try:
-                (
-                    gt_matched_classes,
-                    fg_mask,
-                    pred_ious_matched,
-                    matched_gt_inds,
-                    num_fg,
-                ) = self.matcher(
-                    gt_boxes=gt_boxes.to(pred_boxes_b.device),
-                    gt_classes=gt_labels.to(pred_boxes_b.device),
-                    pred_boxes=pred_boxes_b,
-                    pred_cls_logits=pred_cls_b,
-                    pred_obj_logits=pred_obj_b,
-                    grid_centers=grid_centers,
-                    strides=strides_all,
-                )
-            except RuntimeError as exc:
-                if "CUDA out of memory" not in str(exc):
-                    raise
-                warnings.warn(f"OOM in SimOTA for image {b_idx}, skipping. Error: {exc}")
-                torch.cuda.empty_cache()
-                obj_target = torch.zeros(pred_obj_b.shape[0], 1, device=pred_obj_b.device)
-                total_obj_loss += self.obj_loss_func(pred_obj_b, obj_target).sum()
-                continue
+            (
+                gt_matched_classes,
+                fg_mask,
+                pred_ious_matched,
+                matched_gt_inds,
+                num_fg,
+            ) = self._run_matcher_with_fallback(
+                gt_boxes=gt_boxes.to(pred_boxes_b.device),
+                gt_classes=gt_labels.to(pred_boxes_b.device),
+                pred_boxes=pred_boxes_b,
+                pred_cls_logits=pred_cls_b,
+                pred_obj_logits=pred_obj_b,
+                matching_centers=matching_centers,
+                strides_all=strides_all,
+                image_index=b_idx,
+            )
 
             num_fg_total += num_fg
 
@@ -671,7 +660,7 @@ class YOLOXDetector(nn.Module):
                 l1_target = self._get_l1_target(
                     reg_target_std,
                     strides_all[fg_mask],
-                    grid_centers[fg_mask],
+                    grid_points[fg_mask],
                 )
                 total_l1_loss += self.l1_loss_func(
                     raw_reg_all[b_idx][fg_mask], l1_target
@@ -690,11 +679,60 @@ class YOLOXDetector(nn.Module):
 
         return losses
 
+    def _run_matcher_with_fallback(
+        self,
+        gt_boxes: Tensor,
+        gt_classes: Tensor,
+        pred_boxes: Tensor,
+        pred_cls_logits: Tensor,
+        pred_obj_logits: Tensor,
+        matching_centers: Tensor,
+        strides_all: Tensor,
+        image_index: int,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, int]:
+        """Run SimOTA, retrying on CPU if CUDA runs out of memory."""
+        try:
+            return self.matcher(
+                gt_boxes=gt_boxes,
+                gt_classes=gt_classes,
+                pred_boxes=pred_boxes,
+                pred_cls_logits=pred_cls_logits,
+                pred_obj_logits=pred_obj_logits,
+                grid_centers=matching_centers,
+                strides=strides_all,
+            )
+        except RuntimeError as exc:
+            if "CUDA out of memory" not in str(exc):
+                raise
+
+        warnings.warn(f"OOM in SimOTA for image {image_index}, retrying assignment on CPU.")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        cpu_outputs = self.matcher(
+            gt_boxes=gt_boxes.cpu(),
+            gt_classes=gt_classes.cpu(),
+            pred_boxes=pred_boxes.cpu(),
+            pred_cls_logits=pred_cls_logits.cpu(),
+            pred_obj_logits=pred_obj_logits.cpu(),
+            grid_centers=matching_centers.cpu(),
+            strides=strides_all.cpu(),
+        )
+        gt_matched_classes, fg_mask, pred_ious_matched, matched_gt_inds, num_fg = cpu_outputs
+        out_device = pred_boxes.device
+        return (
+            gt_matched_classes.to(out_device),
+            fg_mask.to(out_device),
+            pred_ious_matched.to(out_device),
+            matched_gt_inds.to(out_device),
+            num_fg,
+        )
+
     def _get_l1_target(
         self,
         gt_boxes_std: Tensor,
         strides: Tensor,
-        grid_centers: Tensor,
+        grid_points: Tensor,
     ) -> Tensor:
         """Compute normalised L1 regression targets for matched foreground points.
 
@@ -704,7 +742,7 @@ class YOLOXDetector(nn.Module):
         Args:
             gt_boxes_std: (num_fg, 2*D) GT boxes in StandardMode.
             strides: (num_fg,) stride per foreground grid point.
-            grid_centers: (num_fg, D) pixel-space centre of each foreground point.
+            grid_points: (num_fg, D) pixel-space grid origin of each foreground point.
 
         Returns:
             (num_fg, 2*D) normalised L1 targets in raw prediction space.
@@ -715,7 +753,7 @@ class YOLOXDetector(nn.Module):
         gt_sz = gt_cs[:, sdims:]
 
         # Normalised centre offset: (gt_ctr - grid_ctr) / stride
-        offset = (gt_ctr - grid_centers) / strides.unsqueeze(-1)
+        offset = (gt_ctr - grid_points) / strides.unsqueeze(-1)
         # Log-size target: log(gt_sz / stride)
         log_sz = torch.log(gt_sz / strides.unsqueeze(-1) + 1e-8)
 

@@ -57,11 +57,12 @@ from torch import Tensor, nn
 from monai.networks.nets import resnet
 from monai.utils import optional_import
 
+from .bifpn import BiFPN
 from .feature_pyramid_network import ExtraFPNBlock, FeaturePyramidNetwork, LastLevelMaxPool
 
 torchvision_models, _ = optional_import("torchvision.models")
 
-__all__ = ["BackboneWithFPN"]
+__all__ = ["BackboneWithFPN", "BackboneWithBiFPN"]
 
 
 class BackboneWithFPN(nn.Module):
@@ -135,6 +136,88 @@ class BackboneWithFPN(nn.Module):
         return y
 
 
+class BackboneWithBiFPN(nn.Module):
+    """
+    Adds a BiFPN neck on top of a backbone model.
+
+    Mirrors :class:`BackboneWithFPN` but uses
+    :class:`~monai.networks.blocks.BiFPN` instead of
+    :class:`~monai.networks.blocks.FeaturePyramidNetwork`.
+
+    Internally, it uses ``torchvision.models._utils.IntermediateLayerGetter``
+    to extract the feature maps specified in ``return_layers``.
+
+    Args:
+        backbone: backbone network.
+        return_layers: dict mapping module names to output names; passed
+            directly to ``IntermediateLayerGetter``.
+        in_channels_list: input channel counts for each returned feature level,
+            ordered from finest to coarsest.
+        out_channels: unified output channel count for BiFPN.
+        spatial_dims: 2 or 3. Inferred from ``backbone`` if not provided.
+        extra_blocks: optional extra block appended after BiFPN (e.g.,
+            :class:`~monai.networks.blocks.LastLevelMaxPool`). Defaults to
+            :class:`~monai.networks.blocks.LastLevelMaxPool`.
+        num_repeats: number of BiFPN layers to stack. Default: ``3``.
+        epsilon: fast normalized fusion stability constant. Default: ``1e-4``.
+        depthwise_separable: use depthwise separable convolutions in BiFPN
+            nodes. Default: ``False``.
+    """
+
+    def __init__(
+        self,
+        backbone: nn.Module,
+        return_layers: dict[str, str],
+        in_channels_list: list[int],
+        out_channels: int,
+        spatial_dims: int | None = None,
+        extra_blocks: ExtraFPNBlock | None = None,
+        num_repeats: int = 3,
+        epsilon: float = 1e-4,
+        depthwise_separable: bool = False,
+    ) -> None:
+        super().__init__()
+
+        if spatial_dims is None:
+            if hasattr(backbone, "spatial_dims") and isinstance(backbone.spatial_dims, int):
+                spatial_dims = backbone.spatial_dims
+            elif isinstance(backbone.conv1, nn.Conv2d):
+                spatial_dims = 2
+            elif isinstance(backbone.conv1, nn.Conv3d):
+                spatial_dims = 3
+            else:
+                raise ValueError("Could not find spatial_dims of backbone, please specify it.")
+
+        if extra_blocks is None:
+            extra_blocks = LastLevelMaxPool(spatial_dims)
+
+        self.body = torchvision_models._utils.IntermediateLayerGetter(backbone, return_layers=return_layers)
+        self.bifpn = BiFPN(
+            spatial_dims=spatial_dims,
+            in_channels_list=in_channels_list,
+            out_channels=out_channels,
+            num_repeats=num_repeats,
+            epsilon=epsilon,
+            extra_blocks=extra_blocks,
+            depthwise_separable=depthwise_separable,
+        )
+        self.out_channels = out_channels
+
+    def forward(self, x: Tensor) -> dict[str, Tensor]:
+        """
+        Computes the resulted feature maps of the network.
+
+        Args:
+            x: input images.
+
+        Returns:
+            feature maps after BiFPN layers, ordered from highest resolution first.
+        """
+        x = self.body(x)
+        y: dict[str, Tensor] = self.bifpn(x)
+        return y
+
+
 def _resnet_fpn_extractor(
     backbone: resnet.ResNet,
     spatial_dims: int,
@@ -172,4 +255,70 @@ def _resnet_fpn_extractor(
     out_channels = 256
     return BackboneWithFPN(
         backbone, return_layers, in_channels_list, out_channels, extra_blocks=extra_blocks, spatial_dims=spatial_dims
+    )
+
+
+def _resnet_bifpn_extractor(
+    backbone: resnet.ResNet,
+    spatial_dims: int,
+    trainable_layers: int = 5,
+    returned_layers: list[int] | None = None,
+    extra_blocks: ExtraFPNBlock | None = None,
+    num_repeats: int = 3,
+    depthwise_separable: bool = False,
+) -> BackboneWithBiFPN:
+    """
+    Construct a :class:`BackboneWithBiFPN` from a MONAI ResNet backbone.
+
+    Mirrors :func:`_resnet_fpn_extractor` but uses BiFPN as the neck.
+
+    Args:
+        backbone: a MONAI :class:`~monai.networks.nets.ResNet` instance.
+        spatial_dims: 2 or 3 for 2D or 3D images.
+        trainable_layers: number of trainable (not frozen) layers starting from
+            the top of the backbone. Valid range: [0, 5]. Default: ``5``.
+        returned_layers: indices of ResNet stages to return as feature maps.
+            Each value must be in [1, 4]. Default: ``[1, 2, 3, 4]``.
+        extra_blocks: optional extra block appended after BiFPN. Defaults to
+            :class:`~monai.networks.blocks.LastLevelMaxPool`.
+        num_repeats: number of BiFPN layers to stack. Default: ``3``.
+        depthwise_separable: use depthwise separable convolutions in BiFPN
+            fusion nodes. Default: ``False``.
+
+    Returns:
+        :class:`BackboneWithBiFPN` wrapping the backbone and BiFPN neck.
+    """
+    if trainable_layers < 0 or trainable_layers > 5:
+        raise ValueError(f"Trainable layers should be in the range [0,5], got {trainable_layers}")
+    layers_to_train = ["layer4", "layer3", "layer2", "layer1", "conv1"][:trainable_layers]
+    if trainable_layers == 5:
+        layers_to_train.append("bn1")
+    for name, parameter in backbone.named_parameters():
+        if all(not name.startswith(layer) for layer in layers_to_train):
+            parameter.requires_grad_(False)
+
+    if extra_blocks is None:
+        extra_blocks = LastLevelMaxPool(spatial_dims)
+
+    if returned_layers is None:
+        returned_layers = [1, 2, 3, 4]
+    if min(returned_layers) <= 0 or max(returned_layers) >= 5:
+        raise ValueError(f"Each returned layer should be in the range [1,4]. Got {returned_layers}")
+    # Sort ascending so that IntermediateLayerGetter emission order matches
+    # the in_channels_list order (finest to coarsest).
+    returned_layers = sorted(returned_layers)
+    return_layers = {f"layer{k}": str(v) for v, k in enumerate(returned_layers)}
+
+    in_channels_stage2 = backbone.in_planes // 8
+    in_channels_list = [in_channels_stage2 * 2 ** (i - 1) for i in returned_layers]
+    out_channels = 256
+    return BackboneWithBiFPN(
+        backbone,
+        return_layers,
+        in_channels_list,
+        out_channels,
+        extra_blocks=extra_blocks,
+        spatial_dims=spatial_dims,
+        num_repeats=num_repeats,
+        depthwise_separable=depthwise_separable,
     )

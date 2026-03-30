@@ -14,7 +14,8 @@ from __future__ import annotations
 from .acti_norm import ADN
 from .activation import GEGLU, MemoryEfficientSwish, Mish, Swish
 from .aspp import SimpleASPP
-from .backbone_fpn_utils import BackboneWithFPN
+from .backbone_fpn_utils import BackboneWithBiFPN, BackboneWithFPN
+from .bifpn import BiFPN, BiFPNLayer, FastNormalizedFusion
 from .cablock import CABlock, FeedForward
 from .convolutions import Convolution, ResidualUnit
 from .crf import CRF

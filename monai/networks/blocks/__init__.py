@@ -47,3 +47,4 @@ from .transformerblock import TransformerBlock
 from .unetr_block import UnetrBasicBlock, UnetrPrUpBlock, UnetrUpBlock
 from .upsample import SubpixelUpsample, Subpixelupsample, SubpixelUpSample, Upsample, UpSample
 from .warp import DVF2DDF, Warp
+from .yolox_blocks import YOLOXBaseConv, YOLOXBottleneck, YOLOXCSPLayer, YOLOXDWConv, YOLOXFocus, YOLOXSPPBottleneck

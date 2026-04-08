@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import math
 import unittest
 
 import torch
@@ -162,6 +163,36 @@ class TestYOLOXDetector2D(unittest.TestCase):
         pred_boxes, _ = self.detector._decode_predictions(reg_maps, grid_points, strides)
         torch.testing.assert_close(pred_boxes[0, 0], torch.tensor([-4.0, -4.0, 4.0, 4.0]))
 
+    def test_decode_predictions_clamps_half_precision_size_logits(self):
+        """AMP-style float16 size logits should stay finite after decode."""
+        cls_maps = [torch.zeros(1, 1, 1, 1), torch.zeros(1, 1, 1, 1), torch.zeros(1, 1, 1, 1)]
+        reg_maps = [
+            torch.tensor([[[[0.0]], [[0.0]], [[11.5]], [[11.5]]]], dtype=torch.float16),
+            torch.zeros(1, 4, 1, 1, dtype=torch.float16),
+            torch.zeros(1, 4, 1, 1, dtype=torch.float16),
+        ]
+        grid_points, strides = self.detector._generate_grids(cls_maps, torch.device("cpu"))
+        pred_boxes, _ = self.detector._decode_predictions(reg_maps, grid_points, strides)
+
+        self.assertTrue(torch.isfinite(pred_boxes).all())
+        decoded_wh = pred_boxes[0, 0, 2:] - pred_boxes[0, 0, :2]
+        expected_max_wh = math.exp(self.detector.boxes_xform_clip) * self.detector.strides[0]
+        self.assertLessEqual(float(decoded_wh.max()), expected_max_wh + 1e-4)
+
+    def test_decode_predictions_sanitizes_nonfinite_regression_outputs(self):
+        """NaN/Inf regression logits should not propagate to decoded boxes or L1 targets."""
+        cls_maps = [torch.zeros(1, 1, 1, 1), torch.zeros(1, 1, 1, 1), torch.zeros(1, 1, 1, 1)]
+        reg_maps = [
+            torch.tensor([[[[float("nan")]], [[float("inf")]], [[float("inf")]], [[float("-inf")]]]]),
+            torch.zeros(1, 4, 1, 1),
+            torch.zeros(1, 4, 1, 1),
+        ]
+        grid_points, strides = self.detector._generate_grids(cls_maps, torch.device("cpu"))
+        pred_boxes, raw_reg_all = self.detector._decode_predictions(reg_maps, grid_points, strides)
+
+        self.assertTrue(torch.isfinite(pred_boxes).all())
+        self.assertTrue(torch.isfinite(raw_reg_all).all())
+
     def test_l1_loss_enabled(self):
         self.detector.set_l1_loss(torch.nn.L1Loss(reduction="none"))
         self.detector.train()
@@ -189,6 +220,22 @@ class TestYOLOXDetector2D(unittest.TestCase):
         torch.testing.assert_close(selected_boxes, torch.tensor([[1.0, 2.0, 3.0, 4.0]]))
         torch.testing.assert_close(selected_scores, torch.tensor([0.8]))
         torch.testing.assert_close(selected_labels, torch.tensor([0]))
+
+    def test_postprocess_uses_objectness_class_product_for_thresholding(self):
+        self.detector.set_box_selector_parameters(score_thresh=0.1, topk_candidates_per_level=10, detections_per_img=10)
+        pred_boxes_std = torch.tensor([[[1.0, 2.0, 3.0, 4.0]]])
+        pred_cls = torch.tensor([[[-1.3862944, -10.0, -10.0]]])  # sigmoid -> [0.2, ~0, ~0]
+        pred_obj = torch.tensor([[[-1.3862944]]])  # sigmoid -> 0.2
+
+        detections = self.detector._postprocess(
+            pred_boxes_std=pred_boxes_std,
+            pred_cls=pred_cls,
+            pred_obj=pred_obj,
+            image_sizes=[[10, 10]],
+            num_anchor_locs_per_level=[1],
+        )
+
+        self.assertEqual(detections[0][self.detector.target_box_key].shape[0], 0)
 
 
 class TestYOLOXDetector3D(unittest.TestCase):

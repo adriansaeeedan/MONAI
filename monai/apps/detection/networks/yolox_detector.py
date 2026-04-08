@@ -24,6 +24,7 @@ returns a list of per-image detection dictionaries.
 
 from __future__ import annotations
 
+import math
 import warnings
 from collections.abc import Callable, Sequence
 from typing import Any
@@ -173,6 +174,7 @@ class YOLOXDetector(nn.Module):
         self.box_loss_func: nn.Module = BoxIoULoss(loss_type="iou", reduction="none")
         self.obj_loss_func: nn.Module = nn.BCEWithLogitsLoss(reduction="none")
         self.l1_loss_func: nn.Module | None = None  # enabled via set_l1_loss()
+        self.boxes_xform_clip = math.log(1000.0 / 16)
 
         # Default SimOTA matcher — initialised without requiring set_simota_matcher()
         self.matcher = SimOTAMatcher(
@@ -522,15 +524,29 @@ class YOLOXDetector(nn.Module):
         level_raw = []
         idx = 0
 
-        for feat_map, stride_val in zip(reg_maps, self.strides):
+        for level_idx, (feat_map, stride_val) in enumerate(zip(reg_maps, self.strides)):
             n_pts = feat_map.shape[2:].numel()
             # Flatten: (B, 2*D, *spatial) → (B, n_pts, 2*D)
             raw = feat_map.flatten(start_dim=2).permute(0, 2, 1)  # (B, n_pts, 2*D)
+            if not torch.isfinite(raw).all():
+                warnings.warn(
+                    f"Non-finite YOLOX box regression outputs detected at FPN level {level_idx}; "
+                    "replacing invalid values before decode.",
+                    stacklevel=2,
+                )
+                raw = raw.clone()
+                raw[..., :sdims] = torch.nan_to_num(raw[..., :sdims], nan=0.0, posinf=0.0, neginf=0.0)
+                raw[..., sdims:] = torch.nan_to_num(
+                    raw[..., sdims:],
+                    nan=0.0,
+                    posinf=self.boxes_xform_clip,
+                    neginf=-self.boxes_xform_clip,
+                )
             level_raw.append(raw)
 
-            gc = grid_points[idx : idx + n_pts]   # (n_pts, D)
-            raw_centre = raw[..., :sdims]  # (B, n, D)
-            raw_size = raw[..., sdims:]     # (B, n, D)
+            gc = grid_points[idx : idx + n_pts].to(dtype=torch.float32)   # (n_pts, D)
+            raw_centre = raw[..., :sdims].to(dtype=torch.float32)  # (B, n, D)
+            raw_size = raw[..., sdims:].to(dtype=torch.float32).clamp(max=self.boxes_xform_clip)  # (B, n, D)
 
             pred_centre = raw_centre * stride_val + gc.unsqueeze(0)  # (B, n, D)
             pred_size = torch.exp(raw_size) * stride_val              # (B, n, D)
@@ -789,10 +805,10 @@ class YOLOXDetector(nn.Module):
         B = pred_boxes_std.shape[0]
         detections: list[dict[str, Tensor]] = []
 
-        # Combined scores: sqrt(sigmoid(obj) * sigmoid(cls)) — YOLOX style
+        # Combined scores: sigmoid(obj) * sigmoid(cls) — YOLOX style
         cls_scores = pred_cls.sigmoid()       # (B, N, C)
         obj_scores = pred_obj.sigmoid()       # (B, N, 1)
-        scores = (cls_scores * obj_scores).sqrt()  # (B, N, C)
+        scores = cls_scores * obj_scores  # (B, N, C)
 
         for b_idx in range(B):
             boxes_b = pred_boxes_std[b_idx]     # (N, 2*D)

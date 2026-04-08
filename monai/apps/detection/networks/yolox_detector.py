@@ -802,32 +802,39 @@ class YOLOXDetector(nn.Module):
         Returns:
             List of detection dicts, one per image.
         """
-        B = pred_boxes_std.shape[0]
-        detections: list[dict[str, Tensor]] = []
+        # Post-processing is non-differentiable and is used only for inference
+        # or optional training-time visualization, so keep it off the autograd graph.
+        pred_boxes_std = pred_boxes_std.detach()
+        pred_cls = pred_cls.detach()
+        pred_obj = pred_obj.detach()
 
-        # Combined scores: sigmoid(obj) * sigmoid(cls) — YOLOX style
-        cls_scores = pred_cls.sigmoid()       # (B, N, C)
-        obj_scores = pred_obj.sigmoid()       # (B, N, 1)
-        scores = cls_scores * obj_scores  # (B, N, C)
+        with torch.no_grad():
+            B = pred_boxes_std.shape[0]
+            detections: list[dict[str, Tensor]] = []
 
-        for b_idx in range(B):
-            boxes_b = pred_boxes_std[b_idx]     # (N, 2*D)
-            scores_b = scores[b_idx]            # (N, C)
-            img_size = image_sizes[b_idx]
+            # Combined scores: sigmoid(obj) * sigmoid(cls) — YOLOX style
+            cls_scores = pred_cls.sigmoid()       # (B, N, C)
+            obj_scores = pred_obj.sigmoid()       # (B, N, 1)
+            scores = cls_scores * obj_scores  # (B, N, C)
 
-            # Split per FPN level for BoxSelector
-            boxes_per_level = list(boxes_b.split(num_anchor_locs_per_level, dim=0))
-            scores_per_level = list(scores_b.split(num_anchor_locs_per_level, dim=0))
+            for b_idx in range(B):
+                boxes_b = pred_boxes_std[b_idx]     # (N, 2*D)
+                scores_b = scores[b_idx]            # (N, C)
+                img_size = image_sizes[b_idx]
 
-            sel_boxes, sel_scores, sel_labels = self.box_selector.select_boxes_per_image(
-                boxes_per_level, scores_per_level, img_size
-            )
-            detections.append(
-                {
-                    self.target_box_key: sel_boxes,
-                    self.pred_score_key: sel_scores,
-                    self.target_label_key: sel_labels,
-                }
-            )
+                # Split per FPN level for BoxSelector
+                boxes_per_level = list(boxes_b.split(num_anchor_locs_per_level, dim=0))
+                scores_per_level = list(scores_b.split(num_anchor_locs_per_level, dim=0))
 
-        return detections
+                sel_boxes, sel_scores, sel_labels = self.box_selector.select_boxes_per_image(
+                    boxes_per_level, scores_per_level, img_size
+                )
+                detections.append(
+                    {
+                        self.target_box_key: sel_boxes,
+                        self.pred_score_key: sel_scores,
+                        self.target_label_key: sel_labels,
+                    }
+                )
+
+            return detections

@@ -162,6 +162,9 @@ class BackboneWithBiFPN(nn.Module):
         epsilon: fast normalized fusion stability constant. Default: ``1e-4``.
         depthwise_separable: use depthwise separable convolutions in BiFPN
             nodes. Default: ``False``.
+        norm: normalization configuration for BiFPN node convolutions.
+            Accepts MONAI norm specs such as ``"batch"`` or
+            ``("group", {"num_groups": 8})``.
     """
 
     def __init__(
@@ -175,6 +178,7 @@ class BackboneWithBiFPN(nn.Module):
         num_repeats: int = 3,
         epsilon: float = 1e-4,
         depthwise_separable: bool = False,
+        norm: tuple | str = ("batch", {"eps": 1e-3, "momentum": 0.01}),
     ) -> None:
         super().__init__()
 
@@ -200,6 +204,7 @@ class BackboneWithBiFPN(nn.Module):
             epsilon=epsilon,
             extra_blocks=extra_blocks,
             depthwise_separable=depthwise_separable,
+            norm=norm,
         )
         self.out_channels = out_channels
 
@@ -266,6 +271,7 @@ def _resnet_bifpn_extractor(
     extra_blocks: ExtraFPNBlock | None = None,
     num_repeats: int = 3,
     depthwise_separable: bool = False,
+    norm: tuple | str = ("batch", {"eps": 1e-3, "momentum": 0.01}),
 ) -> BackboneWithBiFPN:
     """
     Construct a :class:`BackboneWithBiFPN` from a MONAI ResNet backbone.
@@ -284,6 +290,9 @@ def _resnet_bifpn_extractor(
         num_repeats: number of BiFPN layers to stack. Default: ``3``.
         depthwise_separable: use depthwise separable convolutions in BiFPN
             fusion nodes. Default: ``False``.
+        norm: normalization configuration for BiFPN node convolutions.
+            Accepts MONAI norm specs such as ``"batch"`` or
+            ``("group", {"num_groups": 8})``.
 
     Returns:
         :class:`BackboneWithBiFPN` wrapping the backbone and BiFPN neck.
@@ -321,4 +330,5 @@ def _resnet_bifpn_extractor(
         spatial_dims=spatial_dims,
         num_repeats=num_repeats,
         depthwise_separable=depthwise_separable,
+        norm=norm,
     )

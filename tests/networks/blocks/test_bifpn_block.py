@@ -21,7 +21,7 @@ from monai.networks.blocks.backbone_fpn_utils import _resnet_bifpn_extractor
 from monai.networks.blocks.bifpn import BiFPN, BiFPNLayer, FastNormalizedFusion
 from monai.networks.nets.resnet import resnet50
 from monai.utils import optional_import
-from tests.test_utils import test_script_save
+from tests.test_utils import test_script_save as run_script_save
 
 _, has_torchvision = optional_import("torchvision")
 
@@ -96,6 +96,28 @@ TEST_CASES_BACKBONE = [
 ]
 
 
+def _run_bifpn_training_steps(net: BiFPN, data: OrderedDict[str, torch.Tensor], steps: int = 3) -> None:
+    optimizer = torch.optim.SGD(net.parameters(), lr=0.05)
+
+    for _ in range(steps):
+        optimizer.zero_grad(set_to_none=True)
+        result = net(data)
+        for value in result.values():
+            assert torch.isfinite(value).all()
+
+        loss = sum(value.square().mean() for value in result.values())
+        assert torch.isfinite(loss)
+        loss.backward()
+
+        for parameter in net.parameters():
+            if parameter.grad is not None:
+                assert torch.isfinite(parameter.grad).all()
+        optimizer.step()
+
+    for parameter in net.parameters():
+        assert torch.isfinite(parameter).all()
+
+
 class TestFastNormalizedFusion(unittest.TestCase):
     def test_output_shape_2input(self):
         fusion = FastNormalizedFusion(num_inputs=2)
@@ -126,18 +148,33 @@ class TestFastNormalizedFusion(unittest.TestCase):
             FastNormalizedFusion(num_inputs=1)
 
     def test_weights_non_negative_after_forward(self):
-        """Weights after ReLU should always be non-negative."""
+        """Normalized fusion weights should always stay finite and non-negative."""
         fusion = FastNormalizedFusion(num_inputs=2)
         # Manually set weights to negative values.
         with torch.no_grad():
             fusion.weights.fill_(-1.0)
         a = torch.rand(1, 4, 4, 4)
         b = torch.rand(1, 4, 4, 4)
-        # With all-negative weights, ReLU zeros them out; epsilon keeps denominator > 0.
+        # With all-negative raw weights, softplus keeps the normalized weights positive.
         out = fusion([a, b])
         # Should not produce NaN/Inf.
         self.assertFalse(torch.isnan(out).any())
         self.assertFalse(torch.isinf(out).any())
+
+    def test_negative_weights_still_receive_gradients(self):
+        fusion = FastNormalizedFusion(num_inputs=2)
+        with torch.no_grad():
+            fusion.weights.copy_(torch.tensor([-5.0, -4.0]))
+
+        a = torch.rand(1, 4, 4, 4, requires_grad=True)
+        b = torch.rand(1, 4, 4, 4, requires_grad=True)
+        out = fusion([a, b])
+        loss = out.sum()
+        loss.backward()
+
+        self.assertGreater(float(out.abs().sum().detach()), 0.0)
+        self.assertIsNotNone(fusion.weights.grad)
+        self.assertGreater(float(fusion.weights.grad.abs().sum()), 0.0)
 
 
 class TestBiFPNLayer(unittest.TestCase):
@@ -276,6 +313,69 @@ class TestBiFPNBlock(unittest.TestCase):
         self.assertEqual(result["p4"].shape, (1, 32, 4, 4, 4))
         self.assertEqual(result["p5"].shape, (1, 32, 2, 2, 2))
 
+    def test_group_norm_can_be_selected(self):
+        net = BiFPN(
+            spatial_dims=2,
+            in_channels_list=[16, 32, 64],
+            out_channels=8,
+            norm=("group", {"num_groups": 4}),
+        )
+        group_norms = [m for m in net.modules() if isinstance(m, torch.nn.GroupNorm)]
+        batch_norms = [m for m in net.modules() if isinstance(m, torch.nn.modules.batchnorm._BatchNorm)]
+        self.assertGreater(len(group_norms), 0)
+        self.assertEqual(len(batch_norms), 0)
+
+    def test_batch_norm_parameters_are_configurable(self):
+        net = BiFPN(
+            spatial_dims=2,
+            in_channels_list=[16, 32, 64],
+            out_channels=8,
+            norm=("batch", {"eps": 1e-3, "momentum": 0.01}),
+        )
+        batch_norms = [m for m in net.modules() if isinstance(m, torch.nn.BatchNorm2d)]
+        self.assertGreater(len(batch_norms), 0)
+        for norm_layer in batch_norms:
+            self.assertAlmostEqual(norm_layer.eps, 1e-3)
+            self.assertAlmostEqual(norm_layer.momentum, 0.01)
+
+    def test_training_loop_keeps_outputs_finite_with_group_norm(self):
+        net = BiFPN(
+            spatial_dims=2,
+            in_channels_list=[16, 32, 64],
+            out_channels=8,
+            num_repeats=2,
+            norm=("group", {"num_groups": 4}),
+        )
+        data = OrderedDict(
+            {
+                "p3": torch.randn(1, 16, 32, 32),
+                "p4": torch.randn(1, 32, 16, 16),
+                "p5": torch.randn(1, 64, 8, 8),
+            }
+        )
+        _run_bifpn_training_steps(net, data)
+
+    def test_training_loop_keeps_bn_stats_finite_with_custom_batch_norm(self):
+        net = BiFPN(
+            spatial_dims=2,
+            in_channels_list=[16, 32, 64],
+            out_channels=8,
+            num_repeats=2,
+            norm=("batch", {"eps": 1e-3, "momentum": 0.01}),
+        )
+        data = OrderedDict(
+            {
+                "p3": torch.randn(1, 16, 32, 32),
+                "p4": torch.randn(1, 32, 16, 16),
+                "p5": torch.randn(1, 64, 8, 8),
+            }
+        )
+        _run_bifpn_training_steps(net, data)
+
+        for norm_layer in (m for m in net.modules() if isinstance(m, torch.nn.BatchNorm2d)):
+            self.assertTrue(torch.isfinite(norm_layer.running_mean).all())
+            self.assertTrue(torch.isfinite(norm_layer.running_var).all())
+
 
 class TestBiFPNScript(unittest.TestCase):
     @parameterized.expand(TEST_CASES_2LEVEL[:2])  # 2D and 3D base cases
@@ -284,7 +384,7 @@ class TestBiFPNScript(unittest.TestCase):
         data = OrderedDict()
         data["feat0"] = torch.rand(input_shapes[0])
         data["feat1"] = torch.rand(input_shapes[1])
-        test_script_save(net, data)
+        run_script_save(net, data)
 
 
 @unittest.skipUnless(has_torchvision, "Requires torchvision")
@@ -315,7 +415,7 @@ class TestBiFPNWithBackbone(unittest.TestCase):
             returned_layers=input_param["returned_layers"],
         )
         data = torch.rand(input_shape)
-        test_script_save(net, data)
+        run_script_save(net, data)
 
 
 if __name__ == "__main__":

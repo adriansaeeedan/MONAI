@@ -237,6 +237,22 @@ class TestYOLOXDetector2D(unittest.TestCase):
 
         self.assertEqual(detections[0][self.detector.target_box_key].shape[0], 0)
 
+    def test_postprocess_detaches_training_graph(self):
+        pred_boxes_std = torch.tensor([[[1.0, 2.0, 3.0, 4.0]]], requires_grad=True)
+        pred_cls = torch.tensor([[[0.1, -0.2, -0.3]]], requires_grad=True)
+        pred_obj = torch.tensor([[[0.2]]], requires_grad=True)
+
+        detections = self.detector._postprocess(
+            pred_boxes_std=pred_boxes_std,
+            pred_cls=pred_cls,
+            pred_obj=pred_obj,
+            image_sizes=[[10, 10]],
+            num_anchor_locs_per_level=[1],
+        )
+
+        self.assertFalse(detections[0][self.detector.target_box_key].requires_grad)
+        self.assertFalse(detections[0][self.detector.pred_score_key].requires_grad)
+
 
 class TestYOLOXDetector3D(unittest.TestCase):
     def setUp(self):

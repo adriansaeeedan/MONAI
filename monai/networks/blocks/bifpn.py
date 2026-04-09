@@ -29,11 +29,14 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from monai.networks.layers.factories import Conv, Norm
+from monai.networks.layers.factories import Conv
+from monai.networks.layers.utils import get_norm_layer
 
 from .feature_pyramid_network import ExtraFPNBlock
 
 __all__ = ["FastNormalizedFusion", "BiFPNLayer", "BiFPN"]
+
+DEFAULT_BIFPN_NORM: tuple[str, dict[str, float]] = ("batch", {"eps": 1e-3, "momentum": 0.01})
 
 
 class FastNormalizedFusion(nn.Module):
@@ -41,7 +44,7 @@ class FastNormalizedFusion(nn.Module):
     Fast normalized feature fusion from BiFPN.
 
     Each input feature map is assigned a learned scalar weight that is kept
-    non-negative via ReLU. The weights are normalized by their sum plus a small
+    positive via Softplus. The weights are normalized by their sum plus a small
     ``epsilon`` for numerical stability, then applied to the inputs before
     summation.
 
@@ -80,7 +83,8 @@ class FastNormalizedFusion(nn.Module):
         Returns:
             weighted sum of inputs with learned normalized weights.
         """
-        w = F.relu(self.weights)
+        # Softplus keeps weights positive without the dead-gradient corner of ReLU.
+        w = F.softplus(self.weights)
         w = w / (w.sum() + self.epsilon)
         out = inputs[0] * w[0]
         for i in range(1, len(inputs)):
@@ -88,20 +92,25 @@ class FastNormalizedFusion(nn.Module):
         return out
 
 
-def _make_bifpn_node_conv(spatial_dims: int, out_channels: int, depthwise_separable: bool) -> nn.Module:
-    """Create a conv + BN + SiLU block for a BiFPN fusion node."""
+def _make_bifpn_node_conv(
+    spatial_dims: int,
+    out_channels: int,
+    depthwise_separable: bool,
+    norm: tuple | str = DEFAULT_BIFPN_NORM,
+) -> nn.Module:
+    """Create a conv + norm + SiLU block for a BiFPN fusion node."""
     conv_type: Callable = Conv[Conv.CONV, spatial_dims]
-    norm_type: Callable = Norm[Norm.BATCH, spatial_dims]
+    norm_layer = get_norm_layer(name=norm, spatial_dims=spatial_dims, channels=out_channels)
     if depthwise_separable:
         return nn.Sequential(
             conv_type(out_channels, out_channels, 3, padding=1, groups=out_channels, bias=False),
             conv_type(out_channels, out_channels, 1, bias=False),
-            norm_type(out_channels),
+            norm_layer,
             nn.SiLU(),
         )
     return nn.Sequential(
         conv_type(out_channels, out_channels, 3, padding=1, bias=False),
-        norm_type(out_channels),
+        norm_layer,
         nn.SiLU(),
     )
 
@@ -138,6 +147,9 @@ class BiFPNLayer(nn.Module):
         epsilon: small constant for fast normalized fusion stability.
         depthwise_separable: if ``True``, use depthwise separable convolutions
             in each fusion node (matching the EfficientDet architecture).
+        norm: normalization configuration for BiFPN node convolutions.
+            Accepts MONAI norm specs such as ``"batch"`` or
+            ``("group", {"num_groups": 8})``.
     """
 
     def __init__(
@@ -147,6 +159,7 @@ class BiFPNLayer(nn.Module):
         out_channels: int,
         epsilon: float = 1e-4,
         depthwise_separable: bool = False,
+        norm: tuple | str = DEFAULT_BIFPN_NORM,
     ) -> None:
         super().__init__()
         if num_levels < 2:
@@ -160,7 +173,7 @@ class BiFPNLayer(nn.Module):
             [FastNormalizedFusion(2, epsilon) for _ in range(num_levels - 1)]
         )
         self.td_convs: nn.ModuleList = nn.ModuleList(
-            [_make_bifpn_node_conv(spatial_dims, out_channels, depthwise_separable) for _ in range(num_levels - 1)]
+            [_make_bifpn_node_conv(spatial_dims, out_channels, depthwise_separable, norm) for _ in range(num_levels - 1)]
         )
 
         # Bottom-up intermediate path: L-2 fusion nodes (3-input) and L-2 conv blocks.
@@ -169,12 +182,12 @@ class BiFPNLayer(nn.Module):
             [FastNormalizedFusion(3, epsilon) for _ in range(num_levels - 2)]
         )
         self.bu_int_convs: nn.ModuleList = nn.ModuleList(
-            [_make_bifpn_node_conv(spatial_dims, out_channels, depthwise_separable) for _ in range(num_levels - 2)]
+            [_make_bifpn_node_conv(spatial_dims, out_channels, depthwise_separable, norm) for _ in range(num_levels - 2)]
         )
 
         # Bottom-up coarsest node: 1 fusion (2-input) and 1 conv block for level L-1.
         self.bu_top_fusion = FastNormalizedFusion(2, epsilon)
-        self.bu_top_conv = _make_bifpn_node_conv(spatial_dims, out_channels, depthwise_separable)
+        self.bu_top_conv = _make_bifpn_node_conv(spatial_dims, out_channels, depthwise_separable, norm)
 
     def get_result_from_td_fusions(self, inputs: list[Tensor], idx: int) -> Tensor:
         """TorchScript-compatible indexed access for td_fusions ModuleList."""
@@ -303,6 +316,10 @@ class BiFPN(nn.Module):
         depthwise_separable: if ``True``, use depthwise separable convolutions
             in BiFPN fusion nodes, matching the EfficientDet architecture.
             Default: ``False``.
+        norm: normalization configuration for BiFPN node convolutions.
+            Accepts MONAI norm specs such as ``"batch"`` or
+            ``("group", {"num_groups": 8})``. The default uses BatchNorm
+            with BiFPN-friendly ``eps`` and ``momentum``.
 
     Examples::
 
@@ -341,6 +358,7 @@ class BiFPN(nn.Module):
         epsilon: float = 1e-4,
         extra_blocks: ExtraFPNBlock | None = None,
         depthwise_separable: bool = False,
+        norm: tuple | str = DEFAULT_BIFPN_NORM,
     ) -> None:
         super().__init__()
 
@@ -369,7 +387,14 @@ class BiFPN(nn.Module):
         # Stacked BiFPN layers.
         self.bifpn_layers: nn.ModuleList = nn.ModuleList(
             [
-                BiFPNLayer(spatial_dims, num_levels, out_channels, epsilon, depthwise_separable)
+                BiFPNLayer(
+                    spatial_dims,
+                    num_levels,
+                    out_channels,
+                    epsilon,
+                    depthwise_separable,
+                    norm,
+                )
                 for _ in range(num_repeats)
             ]
         )

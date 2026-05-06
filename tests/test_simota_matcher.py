@@ -110,6 +110,53 @@ class TestSimOTAMatcher2D(unittest.TestCase):
         if num_fg > 0:
             self.assertEqual(matched_gt_inds.unique().shape[0], min(num_fg, 2))
 
+    def test_bad_overlap_metric_outputs_are_sanitized(self):
+        """Malformed custom IoU outputs should not poison SimOTA matching."""
+
+        def bad_overlap_metric(boxes1, boxes2):
+            values = torch.tensor(
+                [[float("nan"), float("inf"), -0.25, 1.25]],
+                dtype=boxes2.dtype,
+                device=boxes2.device,
+            )
+            return values[:, : boxes2.shape[0]].expand(boxes1.shape[0], -1)
+
+        matcher = SimOTAMatcher(spatial_dims=2, center_radius=10.0, box_overlap_metric=bad_overlap_metric)
+        centers, strides = _make_grid(2, 2, stride=8)
+        pred_boxes = self._pred_boxes(centers, strides)
+        gt_boxes = torch.tensor([[0.0, 0.0, 32.0, 32.0]])
+        gt_classes = torch.tensor([0])
+        pred_cls = torch.zeros(4, 3)
+        pred_obj = torch.zeros(4, 1)
+
+        _, _, pred_ious, _, num_fg = matcher(gt_boxes, gt_classes, pred_boxes, pred_cls, pred_obj, centers, strides)
+
+        self.assertGreater(num_fg, 0)
+        self.assertTrue(torch.isfinite(pred_ious).all())
+        self.assertTrue(((pred_ious >= 0.0) & (pred_ious <= 1.0)).all())
+
+    def test_nonfinite_logits_do_not_poison_cost(self):
+        """Malformed logits passed directly to SimOTA should not create invalid assignments."""
+        matcher = SimOTAMatcher(spatial_dims=2, center_radius=10.0)
+        centers, strides = _make_grid(2, 2, stride=8)
+        pred_boxes = self._pred_boxes(centers, strides)
+        gt_boxes = torch.tensor([[0.0, 0.0, 32.0, 32.0]])
+        gt_classes = torch.tensor([0])
+        pred_cls = torch.tensor(
+            [
+                [float("nan"), 0.0, 0.0],
+                [float("inf"), 0.0, 0.0],
+                [float("-inf"), 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+            ]
+        )
+        pred_obj = torch.tensor([[float("nan")], [float("inf")], [float("-inf")], [0.0]])
+
+        _, _, pred_ious, _, num_fg = matcher(gt_boxes, gt_classes, pred_boxes, pred_cls, pred_obj, centers, strides)
+
+        self.assertGreater(num_fg, 0)
+        self.assertTrue(torch.isfinite(pred_ious).all())
+
 
 class TestSimOTAMatcher3D(unittest.TestCase):
     def setUp(self):

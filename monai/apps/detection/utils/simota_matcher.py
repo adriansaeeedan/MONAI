@@ -129,23 +129,35 @@ class SimOTAMatcher:
         pair_iou = self.box_overlap_metric(
             gt_boxes.to(pred_boxes_fg.device), pred_boxes_fg
         )  # (num_gt, K)
-        pair_iou_loss = -torch.log(pair_iou + 1e-8)
+        pair_iou = torch.nan_to_num(pair_iou.to(torch.float32), nan=0.0, posinf=1.0, neginf=0.0).clamp(
+            min=0.0, max=1.0
+        )
+        pair_iou_loss = -torch.log(pair_iou.clamp(min=1e-8))
 
         # Pairwise classification cost: (num_gt, K)
         num_classes = cls_logits_fg.shape[-1]
         with torch.cuda.amp.autocast(enabled=False):
+            cls_logits = torch.nan_to_num(cls_logits_fg.float(), nan=0.0, posinf=50.0, neginf=-50.0)
+            obj_logits = torch.nan_to_num(obj_logits_fg.float(), nan=0.0, posinf=50.0, neginf=-50.0)
             cls_score = (
-                cls_logits_fg.float().sigmoid_() * obj_logits_fg.float().sigmoid_()
+                cls_logits.sigmoid() * obj_logits.sigmoid()
             ).sqrt()  # (K, C)
+            eps = torch.finfo(cls_score.dtype).eps
+            cls_score = torch.nan_to_num(cls_score, nan=eps, posinf=1.0 - eps, neginf=eps).clamp(
+                min=eps, max=1.0 - eps
+            )
             gt_cls_onehot = F.one_hot(gt_classes.to(torch.int64), num_classes).float()  # (num_gt, C)
             pair_cls_loss = F.binary_cross_entropy(
                 cls_score.unsqueeze(0).expand(num_gt, -1, -1),   # (num_gt, K, C)
                 gt_cls_onehot.unsqueeze(1).expand(-1, num_candidates, -1),  # (num_gt, K, C)
                 reduction="none",
             ).sum(-1)  # (num_gt, K)
+            pair_cls_loss = torch.nan_to_num(pair_cls_loss, nan=1e6, posinf=1e6, neginf=1e6)
+        pair_iou_loss = torch.nan_to_num(pair_iou_loss, nan=1e6, posinf=1e6, neginf=1e6)
 
         # Combined cost matrix
         cost = pair_cls_loss + 3.0 * pair_iou_loss + 1e6 * (~in_boxes_and_center)  # (num_gt, K)
+        cost = torch.nan_to_num(cost, nan=1e6, posinf=1e6, neginf=1e6)
 
         # Dynamic top-k matching
         (

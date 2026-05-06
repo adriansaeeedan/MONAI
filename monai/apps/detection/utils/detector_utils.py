@@ -40,13 +40,17 @@ def check_input_images(input_images: list[Tensor] | Tensor, spatial_dims: int) -
                 "When input_images is a Tensor, its need to be (spatial_dims + 2)-D."
                 f"In this case, it should be a {(spatial_dims + 2)}-D Tensor, got Tensor shape {input_images.shape}."
             )
+        if not torch.isfinite(input_images).all():
+            raise ValueError("input image is NaN or Inf.")
     elif isinstance(input_images, list):
-        for img in input_images:
+        for idx, img in enumerate(input_images):
             if len(img.shape) != spatial_dims + 1:
                 raise ValueError(
                     "When input_images is a List[Tensor], each element should have be (spatial_dims + 1)-D."
                     f"In this case, it should be a {(spatial_dims + 1)}-D Tensor, got Tensor shape {img.shape}."
                 )
+            if not torch.isfinite(img).all():
+                raise ValueError(f"input image at index {idx} is NaN or Inf.")
     else:
         raise ValueError("input_images needs to be a List[Tensor] or Tensor.")
     return
@@ -58,6 +62,7 @@ def check_training_targets(
     spatial_dims: int,
     target_label_key: str,
     target_box_key: str,
+    num_classes: int | None = None,
 ) -> list[dict[str, Tensor]]:
     """
     Validate the input images/targets during training (raise a `ValueError` if invalid).
@@ -99,12 +104,31 @@ def check_training_targets(
                 )
         if not torch.is_floating_point(boxes):
             raise ValueError(f"Expected target boxes to be a float tensor, got {boxes.dtype}.")
-        targets[i][target_box_key] = standardize_empty_box(boxes, spatial_dims=spatial_dims)  # type: ignore
+        boxes = standardize_empty_box(boxes, spatial_dims=spatial_dims)  # type: ignore[assignment]
+        if not torch.isfinite(boxes).all():
+            raise ValueError("target boxes are NaN or Inf.")
+        if boxes.numel() > 0:
+            box_sizes = boxes[:, spatial_dims:] - boxes[:, :spatial_dims]
+            if (box_sizes <= 0).any():
+                raise ValueError("target boxes must have positive size in every spatial dimension.")
+        targets[i][target_box_key] = boxes
 
         labels = target[target_label_key]
+        if not isinstance(labels, torch.Tensor):
+            raise ValueError(f"Expected target labels to be of type Tensor, got {type(labels)}.")
         if torch.is_floating_point(labels):
+            if not torch.isfinite(labels).all():
+                raise ValueError("target labels are NaN or Inf.")
             warnings.warn(f"Warning: Given target labels is {labels.dtype}. The detector converted it to torch.long.")
-            targets[i][target_label_key] = labels.long()
+            labels = labels.long()
+        if labels.ndim != 1:
+            raise ValueError(f"Expected target labels to be a 1D tensor, got shape {labels.shape}.")
+        if labels.shape[0] != boxes.shape[0]:
+            raise ValueError("target labels and target boxes must contain the same number of entries.")
+        if num_classes is not None and labels.numel() > 0:
+            if labels.min() < 0 or labels.max() >= num_classes:
+                raise ValueError(f"target labels must be in range [0, {num_classes}).")
+        targets[i][target_label_key] = labels
     return targets
 
 

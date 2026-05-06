@@ -140,6 +140,47 @@ class TestYOLOXDetector2D(unittest.TestCase):
         for key, v in losses.items():
             self.assertFalse(torch.isnan(v).any(), f"{key} is NaN with empty targets")
 
+    def test_training_rejects_nonfinite_images(self):
+        self.detector.train()
+        imgs = [torch.rand(1, 128, 128)]
+        imgs[0][0, 0, 0] = float("nan")
+
+        with self.assertRaisesRegex(ValueError, "input image.*NaN or Inf"):
+            self.detector(imgs, _make_targets_2d(1))
+
+    def test_training_rejects_nonfinite_target_boxes(self):
+        self.detector.train()
+        imgs = [torch.rand(1, 128, 128)]
+        targets = _make_targets_2d(1)
+        targets[0]["boxes"][0, 0] = float("inf")
+
+        with self.assertRaisesRegex(ValueError, "target boxes.*NaN or Inf"):
+            self.detector(imgs, targets)
+
+    def test_training_rejects_degenerate_target_boxes(self):
+        self.detector.train()
+        imgs = [torch.rand(1, 128, 128)]
+        targets = [{"boxes": torch.tensor([[10.0, 10.0, 10.0, 50.0]]), "labels": torch.tensor([0])}]
+
+        with self.assertRaisesRegex(ValueError, "positive size"):
+            self.detector(imgs, targets)
+
+    def test_training_rejects_target_label_count_mismatch(self):
+        self.detector.train()
+        imgs = [torch.rand(1, 128, 128)]
+        targets = [{"boxes": torch.tensor([[10.0, 10.0, 50.0, 50.0]]), "labels": torch.tensor([0, 1])}]
+
+        with self.assertRaisesRegex(ValueError, "same number"):
+            self.detector(imgs, targets)
+
+    def test_training_rejects_out_of_range_target_labels(self):
+        self.detector.train()
+        imgs = [torch.rand(1, 128, 128)]
+        targets = [{"boxes": torch.tensor([[10.0, 10.0, 50.0, 50.0]]), "labels": torch.tensor([3])}]
+
+        with self.assertRaisesRegex(ValueError, "range"):
+            self.detector(imgs, targets)
+
     def test_batch_tensor_input(self):
         """Accepts a single (B, C, H, W) Tensor in addition to a list."""
         self.detector.eval()
@@ -180,7 +221,8 @@ class TestYOLOXDetector2D(unittest.TestCase):
         self.assertLessEqual(float(decoded_wh.max()), expected_max_wh + 1e-4)
 
     def test_decode_predictions_sanitizes_nonfinite_regression_outputs(self):
-        """NaN/Inf regression logits should not propagate to decoded boxes or L1 targets."""
+        """NaN/Inf regression logits should not propagate during inference decode."""
+        self.detector.eval()
         cls_maps = [torch.zeros(1, 1, 1, 1), torch.zeros(1, 1, 1, 1), torch.zeros(1, 1, 1, 1)]
         reg_maps = [
             torch.tensor([[[[float("nan")]], [[float("inf")]], [[float("inf")]], [[float("-inf")]]]]),
@@ -192,6 +234,174 @@ class TestYOLOXDetector2D(unittest.TestCase):
 
         self.assertTrue(torch.isfinite(pred_boxes).all())
         self.assertTrue(torch.isfinite(raw_reg_all).all())
+
+    def test_decode_predictions_rejects_nonfinite_regression_outputs_in_training(self):
+        """Training should fail fast instead of hiding invalid regression outputs."""
+        self.detector.train()
+        cls_maps = [torch.zeros(1, 1, 1, 1), torch.zeros(1, 1, 1, 1), torch.zeros(1, 1, 1, 1)]
+        reg_maps = [
+            torch.tensor([[[[float("nan")]], [[0.0]], [[0.0]], [[0.0]]]]),
+            torch.zeros(1, 4, 1, 1),
+            torch.zeros(1, 4, 1, 1),
+        ]
+        grid_points, strides = self.detector._generate_grids(cls_maps, torch.device("cpu"))
+
+        with self.assertRaisesRegex(ValueError, "box regression outputs.*NaN or Inf"):
+            self.detector._decode_predictions(reg_maps, grid_points, strides)
+
+    def test_decode_predictions_clamps_large_center_offsets(self):
+        """Large finite centre logits should not overflow decoded boxes."""
+        cls_maps = [torch.zeros(1, 1, 1, 1), torch.zeros(1, 1, 1, 1), torch.zeros(1, 1, 1, 1)]
+        reg_maps = [
+            torch.tensor([[[[1.0e38]], [[-1.0e38]], [[0.0]], [[0.0]]]]),
+            torch.zeros(1, 4, 1, 1),
+            torch.zeros(1, 4, 1, 1),
+        ]
+        grid_points, strides = self.detector._generate_grids(cls_maps, torch.device("cpu"))
+        pred_boxes, _ = self.detector._decode_predictions(reg_maps, grid_points, strides)
+
+        self.assertTrue(torch.isfinite(pred_boxes).all())
+
+    def test_decode_predictions_clamps_tiny_decoded_sizes(self):
+        """Very negative size logits should still decode to positive-size boxes."""
+        cls_maps = [torch.zeros(1, 1, 1, 1), torch.zeros(1, 1, 1, 1), torch.zeros(1, 1, 1, 1)]
+        reg_maps = [
+            torch.tensor([[[[0.0]], [[0.0]], [[-1000.0]], [[-1000.0]]]]),
+            torch.zeros(1, 4, 1, 1),
+            torch.zeros(1, 4, 1, 1),
+        ]
+        grid_points, strides = self.detector._generate_grids(cls_maps, torch.device("cpu"))
+        pred_boxes, _ = self.detector._decode_predictions(reg_maps, grid_points, strides)
+
+        decoded_wh = pred_boxes[0, 0, 2:] - pred_boxes[0, 0, :2]
+        self.assertTrue(torch.isfinite(pred_boxes).all())
+        self.assertGreater(float(decoded_wh.min()), 0.0)
+
+    def test_l1_target_clamps_tiny_box_sizes(self):
+        """Tiny but valid GT boxes should not create unbounded log-size L1 targets."""
+        gt_boxes = torch.tensor([[0.0, 0.0, 1.0e-12, 1.0e-12]])
+        strides = torch.tensor([8.0])
+        grid_points = torch.tensor([[0.0, 0.0]])
+        l1_target = self.detector._get_l1_target(gt_boxes, strides, grid_points)
+
+        self.assertTrue(torch.isfinite(l1_target).all())
+        self.assertGreaterEqual(float(l1_target[:, 2:].min()), math.log(self.detector.min_box_size / 8.0))
+
+    def test_compute_losses_rejects_nonfinite_classification_logits(self):
+        """Training loss should fail fast on invalid classification logits."""
+        self.detector.train()
+        pred_boxes_std = torch.tensor([[[0.0, 0.0, 8.0, 8.0], [8.0, 8.0, 16.0, 16.0]]])
+        pred_cls = torch.zeros(1, 2, 3)
+        pred_cls[0, 0, 0] = float("nan")
+        pred_obj = torch.zeros(1, 2, 1)
+        raw_reg_all = torch.zeros(1, 2, 4)
+        grid_points = torch.tensor([[0.0, 0.0], [8.0, 8.0]])
+        strides_all = torch.tensor([8.0, 8.0])
+        targets = [{"boxes": torch.zeros(0, 4), "labels": torch.zeros(0, dtype=torch.long)}]
+
+        with self.assertRaisesRegex(ValueError, "classification logits.*NaN or Inf"):
+            self.detector._compute_losses(
+                pred_boxes_std, pred_cls, pred_obj, raw_reg_all, grid_points, strides_all, targets, [2]
+            )
+
+    def test_compute_losses_rejects_nonfinite_objectness_logits(self):
+        """Training loss should fail fast on invalid objectness logits."""
+        self.detector.train()
+        pred_boxes_std = torch.tensor([[[0.0, 0.0, 8.0, 8.0], [8.0, 8.0, 16.0, 16.0]]])
+        pred_cls = torch.zeros(1, 2, 3)
+        pred_obj = torch.zeros(1, 2, 1)
+        pred_obj[0, 0, 0] = float("inf")
+        raw_reg_all = torch.zeros(1, 2, 4)
+        grid_points = torch.tensor([[0.0, 0.0], [8.0, 8.0]])
+        strides_all = torch.tensor([8.0, 8.0])
+        targets = [{"boxes": torch.zeros(0, 4), "labels": torch.zeros(0, dtype=torch.long)}]
+
+        with self.assertRaisesRegex(ValueError, "objectness logits.*NaN or Inf"):
+            self.detector._compute_losses(
+                pred_boxes_std, pred_cls, pred_obj, raw_reg_all, grid_points, strides_all, targets, [2]
+            )
+
+    def test_empty_positive_objectness_loss_is_normalized_by_prediction_locations(self):
+        """All-empty batches should average objectness over dense prediction locations."""
+        self.detector.train()
+        pred_boxes_std = torch.zeros(2, 3, 4)
+        pred_cls = torch.zeros(2, 3, 3)
+        pred_obj = torch.zeros(2, 3, 1)
+        raw_reg_all = torch.zeros(2, 3, 4)
+        grid_points = torch.tensor([[0.0, 0.0], [8.0, 0.0], [16.0, 0.0]])
+        strides_all = torch.tensor([8.0, 8.0, 8.0])
+        targets = [
+            {"boxes": torch.zeros(0, 4), "labels": torch.zeros(0, dtype=torch.long)},
+            {"boxes": torch.zeros(0, 4), "labels": torch.zeros(0, dtype=torch.long)},
+        ]
+
+        losses = self.detector._compute_losses(
+            pred_boxes_std, pred_cls, pred_obj, raw_reg_all, grid_points, strides_all, targets, [3]
+        )
+
+        expected_obj = torch.nn.functional.binary_cross_entropy_with_logits(
+            pred_obj, torch.zeros_like(pred_obj), reduction="mean"
+        )
+        torch.testing.assert_close(losses[self.detector.obj_key].squeeze(), expected_obj)
+
+    def test_eval_sanitizes_nonfinite_logits(self):
+        """Eval should replace non-finite logits with finite sentinel values."""
+        self.detector.eval()
+        logits = torch.tensor([[[float("nan"), float("inf"), float("-inf")]]])
+        sanitized = self.detector._check_or_sanitize_logits("classification", logits)
+
+        self.assertTrue(torch.isfinite(sanitized).all())
+        self.assertLess(float(sanitized[0, 0, 0]), 0.0)
+        self.assertGreater(float(sanitized[0, 0, 1]), 0.0)
+        self.assertLess(float(sanitized[0, 0, 2]), 0.0)
+
+    def test_postprocess_returns_finite_scores_with_nonfinite_logits(self):
+        """Inference postprocessing should not emit NaN/Inf scores."""
+        self.detector.eval()
+        pred_boxes_std = torch.tensor([[[1.0, 1.0, 3.0, 3.0], [4.0, 4.0, 6.0, 6.0]]])
+        pred_cls = torch.tensor([[[float("nan"), -10.0, -10.0], [float("inf"), -10.0, -10.0]]])
+        pred_obj = torch.tensor([[[0.0], [float("inf")]]])
+
+        detections = self.detector._postprocess(
+            pred_boxes_std=pred_boxes_std,
+            pred_cls=pred_cls,
+            pred_obj=pred_obj,
+            image_sizes=[[10, 10]],
+            num_anchor_locs_per_level=[2],
+        )
+
+        self.assertTrue(torch.isfinite(detections[0][self.detector.pred_score_key]).all())
+
+    def test_postprocess_sanitizes_nonfinite_boxes_before_selection(self):
+        """BoxSelector should not receive NaN/Inf boxes during inference."""
+
+        class FiniteInputBoxSelector:
+            def select_boxes_per_image(self, boxes_list, logits_list, spatial_size):
+                for boxes in boxes_list:
+                    if not torch.isfinite(boxes).all():
+                        raise ValueError("BoxSelector received non-finite boxes.")
+                for logits in logits_list:
+                    if not torch.isfinite(logits).all():
+                        raise ValueError("BoxSelector received non-finite scores.")
+                return torch.zeros(0, 4), torch.zeros(0), torch.zeros(0, dtype=torch.long)
+
+        self.detector.eval()
+        self.detector.box_selector = FiniteInputBoxSelector()  # type: ignore[assignment]
+        pred_boxes_std = torch.tensor(
+            [[[float("nan"), 1.0, 3.0, 4.0], [4.0, 4.0, float("inf"), 6.0], [1.0, 1.0, 2.0, 2.0]]]
+        )
+        pred_cls = torch.zeros(1, 3, 3)
+        pred_obj = torch.zeros(1, 3, 1)
+
+        detections = self.detector._postprocess(
+            pred_boxes_std=pred_boxes_std,
+            pred_cls=pred_cls,
+            pred_obj=pred_obj,
+            image_sizes=[[10, 10]],
+            num_anchor_locs_per_level=[3],
+        )
+
+        self.assertEqual(detections[0][self.detector.target_box_key].shape[0], 0)
 
     def test_l1_loss_enabled(self):
         self.detector.set_l1_loss(torch.nn.L1Loss(reduction="none"))

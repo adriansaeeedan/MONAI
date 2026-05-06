@@ -257,6 +257,8 @@ class YOLOXHeadModule(nn.Module):
             prior_prob: initial probability for foreground predictions.
                 Defaults to 0.01.
         """
+        if not math.isfinite(prior_prob) or prior_prob <= 0.0 or prior_prob >= 1.0:
+            raise ValueError(f"prior_prob must be finite and in the open interval (0, 1), got {prior_prob}.")
         bias_value = -math.log((1 - prior_prob) / prior_prob)
         for cls_pred, obj_pred in zip(self.cls_preds, self.obj_preds):
             nn.init.constant_(cls_pred.bias, bias_value)

@@ -175,6 +175,9 @@ class YOLOXDetector(nn.Module):
         self.obj_loss_func: nn.Module = nn.BCEWithLogitsLoss(reduction="none")
         self.l1_loss_func: nn.Module | None = None  # enabled via set_l1_loss()
         self.boxes_xform_clip = math.log(1000.0 / 16)
+        self.center_xform_clip = 1000.0
+        self.min_box_size = 1.0e-4
+        self.logit_xform_clip = 1.0e4
 
         # Default SimOTA matcher — initialised without requiring set_simota_matcher()
         self.matcher = SimOTAMatcher(
@@ -367,7 +370,12 @@ class YOLOXDetector(nn.Module):
         """
         if self.training:
             targets = check_training_targets(
-                input_images, targets, self.spatial_dims, self.target_label_key, self.target_box_key
+                input_images,
+                targets,
+                self.spatial_dims,
+                self.target_label_key,
+                self.target_box_key,
+                num_classes=self.num_classes,
             )
 
         # 1. Pad images to a uniform size divisible by self.size_divisible
@@ -529,11 +537,10 @@ class YOLOXDetector(nn.Module):
             # Flatten: (B, 2*D, *spatial) → (B, n_pts, 2*D)
             raw = feat_map.flatten(start_dim=2).permute(0, 2, 1)  # (B, n_pts, 2*D)
             if not torch.isfinite(raw).all():
-                warnings.warn(
-                    f"Non-finite YOLOX box regression outputs detected at FPN level {level_idx}; "
-                    "replacing invalid values before decode.",
-                    stacklevel=2,
-                )
+                msg = f"YOLOX box regression outputs are NaN or Inf at FPN level {level_idx}."
+                if self.training:
+                    raise ValueError(msg)
+                warnings.warn(f"{msg} Replacing invalid values before decode.", stacklevel=2)
                 raw = raw.clone()
                 raw[..., :sdims] = torch.nan_to_num(raw[..., :sdims], nan=0.0, posinf=0.0, neginf=0.0)
                 raw[..., sdims:] = torch.nan_to_num(
@@ -545,15 +552,25 @@ class YOLOXDetector(nn.Module):
             level_raw.append(raw)
 
             gc = grid_points[idx : idx + n_pts].to(dtype=torch.float32)   # (n_pts, D)
-            raw_centre = raw[..., :sdims].to(dtype=torch.float32)  # (B, n, D)
-            raw_size = raw[..., sdims:].to(dtype=torch.float32).clamp(max=self.boxes_xform_clip)  # (B, n, D)
+            raw_centre = raw[..., :sdims].to(dtype=torch.float32).clamp(
+                min=-self.center_xform_clip, max=self.center_xform_clip
+            )  # (B, n, D)
+            raw_size_min = math.log(self.min_box_size / float(stride_val))
+            raw_size = raw[..., sdims:].to(dtype=torch.float32).clamp(  # (B, n, D)
+                min=raw_size_min, max=self.boxes_xform_clip
+            )
 
             pred_centre = raw_centre * stride_val + gc.unsqueeze(0)  # (B, n, D)
             pred_size = torch.exp(raw_size) * stride_val              # (B, n, D)
 
             # centre-size → StandardMode
-            pred_cs = torch.cat([pred_centre, pred_size], dim=-1)  # (B, n, 2*D)
             pred_std = torch.cat([pred_centre - pred_size * 0.5, pred_centre + pred_size * 0.5], dim=-1)
+            if not torch.isfinite(pred_std).all():
+                msg = f"Decoded YOLOX boxes are NaN or Inf at FPN level {level_idx}."
+                if self.training:
+                    raise ValueError(msg)
+                warnings.warn(f"{msg} Replacing invalid boxes with zeros.", stacklevel=2)
+                pred_std = torch.nan_to_num(pred_std, nan=0.0, posinf=0.0, neginf=0.0)
             level_preds.append(pred_std)
             idx += n_pts
 
@@ -576,6 +593,22 @@ class YOLOXDetector(nn.Module):
     # ------------------------------------------------------------------
     # Training: loss computation
     # ------------------------------------------------------------------
+
+    def _check_or_sanitize_logits(self, name: str, logits: Tensor) -> Tensor:
+        """Fail fast on invalid training logits; sanitize invalid eval logits."""
+        if torch.isfinite(logits).all():
+            return logits
+
+        msg = f"YOLOX {name} logits are NaN or Inf."
+        if self.training:
+            raise ValueError(msg)
+
+        warnings.warn(f"{msg} Replacing invalid values before use.", stacklevel=2)
+        neg_clip = -self.logit_xform_clip
+        pos_clip = self.logit_xform_clip
+        return torch.nan_to_num(logits, nan=neg_clip, posinf=pos_clip, neginf=neg_clip).clamp(
+            min=neg_clip, max=pos_clip
+        )
 
     def _compute_losses(
         self,
@@ -604,6 +637,9 @@ class YOLOXDetector(nn.Module):
             Dict of scalar loss tensors.
         """
         device = pred_boxes_std.device
+        pred_cls = self._check_or_sanitize_logits("classification", pred_cls)
+        pred_obj = self._check_or_sanitize_logits("objectness", pred_obj)
+
         total_iou_loss = torch.zeros(1, device=device)
         total_cls_loss = torch.zeros(1, device=device)
         total_obj_loss = torch.zeros(1, device=device)
@@ -611,6 +647,7 @@ class YOLOXDetector(nn.Module):
         num_fg_total = 0
         num_gt_total = 0
         B = pred_boxes_std.shape[0]
+        num_prediction_locs_total = max(int(pred_obj.shape[0] * pred_obj.shape[1]), 1)
         matching_centers = grid_points + 0.5 * strides_all.unsqueeze(-1)
 
         for b_idx in range(B):
@@ -682,16 +719,17 @@ class YOLOXDetector(nn.Module):
                     raw_reg_all[b_idx][fg_mask], l1_target
                 ).sum()
 
-        num_fg_total = max(num_fg_total, 1)
+        num_fg_normalizer = max(num_fg_total, 1)
+        obj_normalizer = num_fg_total if num_fg_total > 0 else num_prediction_locs_total
         reg_weight = 5.0
 
         losses = {
-            self.cls_key: total_cls_loss / num_fg_total,
-            self.box_reg_key: reg_weight * total_iou_loss / num_fg_total,
-            self.obj_key: total_obj_loss / num_fg_total,
+            self.cls_key: total_cls_loss / num_fg_normalizer,
+            self.box_reg_key: reg_weight * total_iou_loss / num_fg_normalizer,
+            self.obj_key: total_obj_loss / obj_normalizer,
         }
         if self.l1_loss_func is not None:
-            losses["l1"] = total_l1_loss / num_fg_total
+            losses["l1"] = total_l1_loss / num_fg_normalizer
 
         return losses
 
@@ -766,12 +804,14 @@ class YOLOXDetector(nn.Module):
         sdims = self.spatial_dims
         gt_cs = _standard_to_center_size(gt_boxes_std, sdims)  # (num_fg, 2*D)
         gt_ctr = gt_cs[:, :sdims]
-        gt_sz = gt_cs[:, sdims:]
+        gt_sz = gt_cs[:, sdims:].clamp(min=self.min_box_size)
 
         # Normalised centre offset: (gt_ctr - grid_ctr) / stride
         offset = (gt_ctr - grid_points) / strides.unsqueeze(-1)
         # Log-size target: log(gt_sz / stride)
-        log_sz = torch.log(gt_sz / strides.unsqueeze(-1) + 1e-8)
+        log_sz = torch.log(gt_sz / strides.unsqueeze(-1))
+        min_log_sz = torch.log(gt_sz.new_full(gt_sz.shape, self.min_box_size) / strides.unsqueeze(-1))
+        log_sz = torch.maximum(log_sz, min_log_sz).clamp(max=self.boxes_xform_clip)
 
         return torch.cat([offset, log_sz], dim=-1)
 
@@ -809,6 +849,9 @@ class YOLOXDetector(nn.Module):
         pred_obj = pred_obj.detach()
 
         with torch.no_grad():
+            pred_cls = self._check_or_sanitize_logits("classification", pred_cls)
+            pred_obj = self._check_or_sanitize_logits("objectness", pred_obj)
+
             B = pred_boxes_std.shape[0]
             detections: list[dict[str, Tensor]] = []
 
@@ -816,11 +859,21 @@ class YOLOXDetector(nn.Module):
             cls_scores = pred_cls.sigmoid()       # (B, N, C)
             obj_scores = pred_obj.sigmoid()       # (B, N, 1)
             scores = cls_scores * obj_scores  # (B, N, C)
+            scores = torch.nan_to_num(scores, nan=0.0, posinf=1.0, neginf=0.0).clamp(min=0.0, max=1.0)
 
             for b_idx in range(B):
                 boxes_b = pred_boxes_std[b_idx]     # (N, 2*D)
                 scores_b = scores[b_idx]            # (N, C)
                 img_size = image_sizes[b_idx]
+                finite_boxes = torch.isfinite(boxes_b).all(dim=-1)
+                if not finite_boxes.all():
+                    warnings.warn(
+                        f"Non-finite YOLOX decoded boxes detected for image {b_idx}; "
+                        "suppressing them before box selection.",
+                        stacklevel=2,
+                    )
+                    boxes_b = torch.nan_to_num(boxes_b, nan=0.0, posinf=0.0, neginf=0.0)
+                    scores_b = scores_b.masked_fill(~finite_boxes.unsqueeze(-1), 0.0)
 
                 # Split per FPN level for BoxSelector
                 boxes_per_level = list(boxes_b.split(num_anchor_locs_per_level, dim=0))

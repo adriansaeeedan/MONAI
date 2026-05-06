@@ -17,6 +17,7 @@ import torch
 
 from monai.apps.detection.networks.yolox_network import (
     YOLOPAFPN,
+    YOLOXHeadModule,
     YOLOXNetwork,
     yolox_darknet_pafpn_network,
 )
@@ -121,6 +122,15 @@ class TestYOLOXNetwork(unittest.TestCase):
     def test_factory_invalid_size(self):
         with self.assertRaises(ValueError):
             yolox_darknet_pafpn_network(2, 3, model_size="xl")
+
+
+class TestYOLOXHeadModule(unittest.TestCase):
+    def test_initialize_biases_rejects_invalid_prior_probability(self):
+        head = YOLOXHeadModule(spatial_dims=2, num_classes=3, width=0.25, in_channels=(256,))
+        for prior_prob in (0.0, 1.0, -0.1, float("nan"), float("inf")):
+            with self.subTest(prior_prob=prior_prob):
+                with self.assertRaises(ValueError):
+                    head.initialize_biases(prior_prob=prior_prob)
 
 
 if __name__ == "__main__":
